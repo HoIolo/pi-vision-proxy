@@ -480,23 +480,18 @@ export default function (pi: ExtensionAPI) {
       if (ti < 0) return m;
       const t = targets[ti];
       const descs = cachedDescs(visionModel, t.images, t.userText);
-      // 未识别过的图片: 占位提示并引导主模型用工具按需查看(不自动识别历史图片)
-      const paths = [...t.userText.matchAll(IMAGE_PATH_RE)]
-        .map((mm) => mm[2])
-        .filter((p) => existsSync(p));
-      const placeholder = paths.length > 0
-        ? `[图片未自动识别, 需要查看时可调用 vision_describe("${paths[0]}")]`
-        : "[图片未自动识别(历史图片), 需要查看时调用 vision_describe 并传入图片路径]";
       const newContent = [];
       let imgIdx = 0;
       for (const block of m.content) {
         if (block.type === "image") {
           const desc = descs?.[imgIdx++];
-          newContent.push(
-            desc
-              ? { type: "text", text: `[图片识别结果 - ${visionModel}]\n${desc}` }
-              : { type: "text", text: placeholder },
-          );
+          if (desc) {
+            newContent.push({ type: "text", text: `[图片识别结果 - ${visionModel}]\n${desc}` });
+          } else {
+            // 未识别过的图片: 原样保留, 不自动识别不占位(pi 对 text-only 模型自动省略,
+            // 主模型需要时可调用 vision_describe 工具按需查看)
+            newContent.push(block);
+          }
         } else {
           newContent.push(block);
         }
