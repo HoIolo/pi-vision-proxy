@@ -4,6 +4,7 @@ import { dirname, extname, join } from "node:path";
 import { uuidv7, type ImageContent } from "@earendil-works/pi-ai";
 import { complete, type Message } from "@earendil-works/pi-ai/compat";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 /**
  * 图片识别代理(优化版):
@@ -321,6 +322,50 @@ export default function (pi: ExtensionAPI) {
     }
     if (!changed) return;
     return { messages };
+  });
+
+  // 主模型可主动调用的识图工具: 需要查看任意本地图片时自行调用
+  pi.registerTool({
+    name: "vision_describe",
+    label: "识图",
+    description:
+      "识别/描述一张本地图片(调用独立的多模态识图模型, 不消耗主模型多模态能力)。当主模型只支持文本、需要查看图片内容时调用, 例如用户消息中提到的图片文件、工具生成或发现的截图等。参数 path 为本地图片文件路径(支持 png/jpg/jpeg/gif/webp/bmp)。",
+    promptSnippet: "vision_describe(path) - 用多模态识图模型描述本地图片内容",
+    parameters: Type.Object({
+      path: Type.String({ description: "本地图片文件路径" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const image = readImageFile(params.path);
+      if (!image) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `无法读取图片 ${params.path}: 文件不存在、不可读或格式不支持(仅支持 png/jpg/jpeg/gif/webp/bmp)`,
+            },
+          ],
+          details: {},
+        };
+      }
+      const { visionModel } = readConfig();
+      try {
+        const [desc] = await describeImages(ctx, visionModel, [image], "");
+        return {
+          content: [{ type: "text" as const, text: desc ?? "[图片识别失败, 已跳过]" }],
+          details: {},
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `[图片识别出错: ${err instanceof Error ? err.message : String(err)}]`,
+            },
+          ],
+          details: {},
+        };
+      }
+    },
   });
 
   pi.registerCommand("vision-model", {
