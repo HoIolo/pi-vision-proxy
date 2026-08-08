@@ -95,7 +95,8 @@ function writeConfig(config: VisionConfig): void {
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), "utf8");
 }
 
-// 结果缓存 + 单飞去重: 同一张图片(按内容哈希)在同一识图模型下只识别一次
+// 结果缓存 + 单飞去重: 同一张图片(按内容哈希)在同一识图模型、同一 prompt 下只识别一次;
+// prompt 不同视为不同请求(允许对同一张图深入查看/换角度提问)
 const descCache = new Map<string, string>();
 const inFlight = new Map<string, Promise<string | undefined>>();
 
@@ -108,9 +109,10 @@ function notifyOnce(ctx: ExtensionContext, key: string, message: string): void {
   if (ctx.hasUI) ctx.ui.notify(message, "warning");
 }
 
-function cacheKey(visionModel: string, image: ImageContent): string {
+function cacheKey(visionModel: string, image: ImageContent, prompt = ""): string {
   const hash = createHash("sha1").update(image.data).digest("hex");
-  return `${visionModel}:${hash}`;
+  const promptHash = createHash("sha1").update(prompt).digest("hex").slice(0, 12);
+  return `${visionModel}:${hash}:${promptHash}`;
 }
 
 function parseModelRef(ref: string): { provider?: string; id: string } {
@@ -195,7 +197,7 @@ function describeImage(
   image: ImageContent,
   userText: string,
 ): Promise<string | undefined> {
-  const key = cacheKey(visionModel, image);
+  const key = cacheKey(visionModel, image, userText);
   const cached = descCache.get(key);
   if (cached !== undefined) return Promise.resolve(cached);
   const pending = inFlight.get(key);
@@ -322,6 +324,18 @@ export default function (pi: ExtensionAPI) {
     }
     if (!changed) return;
     return { messages };
+  });
+
+  // 多模态主模型下禁用 vision_describe: 拦截调用(pi 扩展 API 无工具注销机制, 用运行时拦截达到等效效果)
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "vision_describe") return;
+    const model = ctx.model;
+    if (model?.input?.includes("image")) {
+      return {
+        block: true,
+        reason: `当前模型 ${model.provider}/${model.id} 原生支持图片输入, 不需要 vision_describe 工具, 请直接查看图片`,
+      };
+    }
   });
 
   // 主模型可主动调用的识图工具: 需要查看任意本地图片时自行调用, 可携带处理要求
