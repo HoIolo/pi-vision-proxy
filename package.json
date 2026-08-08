@@ -1,0 +1,14 @@
+{
+  "name": "pi-vision-proxy",
+  "version": "1.0.0",
+  "description": "Pi extension: routes image understanding to a multimodal model when your main model is text-only. Paste/attach images as usual; the proxy describes them in the background and feeds the description to the text-only main model.",
+  "keywords": ["pi-package", "vision", "multimodal", "image", "extension"],
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
