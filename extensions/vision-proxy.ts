@@ -258,11 +258,9 @@ export default function (pi: ExtensionAPI) {
     const images = [...pathImages, ...(event.images ?? [])];
     if (images.length === 0) return;
 
-    // 后台预热识别, 不阻塞发送; 完成后清除提示
-    ctx.ui.setStatus("vision-proxy", `识别图片中... (${visionModel})`);
+    // 后台预热识别, 不阻塞发送; 完成后清除提示(不占用底部状态栏)
     ctx.ui.setWorkingMessage(`识别图片中... (${visionModel})`);
     void describeImages(ctx, visionModel, images, userText).finally(() => {
-      ctx.ui.setStatus("vision-proxy", undefined);
       ctx.ui.setWorkingMessage();
     });
 
@@ -296,13 +294,11 @@ export default function (pi: ExtensionAPI) {
         .map((c) => c.text)
         .join("\n");
 
-      ctx.ui.setStatus("vision-proxy", `识别图片中... (${visionModel})`);
       ctx.ui.setWorkingMessage(`识别图片中... (${visionModel})`);
       let descs: Array<string | undefined>;
       try {
         descs = await describeImages(ctx, visionModel, images, userText);
       } finally {
-        ctx.ui.setStatus("vision-proxy", undefined);
         ctx.ui.setWorkingMessage();
       }
 
