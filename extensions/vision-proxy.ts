@@ -397,15 +397,18 @@ export default function (pi: ExtensionAPI) {
     if (model.input?.includes("image")) return;
 
     const { visionModel } = readConfig();
-    let changed = false;
-    const messages = [];
+    // 收集历史中所有含图片块的消息(切换模型后旧的多模态消息也会被替换为描述)
+    const targets: Array<{
+      msg: (typeof event.messages)[number];
+      images: ImageContent[];
+      userText: string;
+    }> = [];
     for (const m of event.messages) {
       if (
         m.role !== "user" ||
         typeof m.content === "string" ||
         !m.content.some((c) => c.type === "image")
       ) {
-        messages.push(m);
         continue;
       }
       const images = m.content.filter((c): c is ImageContent => c.type === "image");
@@ -413,15 +416,25 @@ export default function (pi: ExtensionAPI) {
         .filter((c) => c.type === "text")
         .map((c) => c.text)
         .join("\n");
+      targets.push({ msg: m, images, userText });
+    }
+    if (targets.length === 0) return;
 
-      ctx.ui.setWorkingMessage(`识别图片中... (${visionModel})`);
-      let descs: Array<string | undefined>;
-      try {
-        descs = await describeImages(ctx, visionModel, images, userText);
-      } finally {
-        ctx.ui.setWorkingMessage();
-      }
+    // 所有含图消息并行识别(切换模型后历史多图也不阻塞太久)
+    ctx.ui.setWorkingMessage(`识别图片中... (${visionModel})`);
+    let results: Array<Array<string | undefined>>;
+    try {
+      results = await Promise.all(
+        targets.map((t) => describeImages(ctx, visionModel, t.images, t.userText)),
+      );
+    } finally {
+      ctx.ui.setWorkingMessage();
+    }
 
+    const messages = event.messages.map((m) => {
+      const ti = targets.findIndex((t) => t.msg === m);
+      if (ti < 0) return m;
+      const descs = results[ti];
       const newContent = [];
       let imgIdx = 0;
       for (const block of m.content) {
@@ -436,10 +449,8 @@ export default function (pi: ExtensionAPI) {
           newContent.push(block);
         }
       }
-      messages.push({ ...m, content: newContent });
-      changed = true;
-    }
-    if (!changed) return;
+      return { ...m, content: newContent };
+    });
     return { messages };
   });
 
