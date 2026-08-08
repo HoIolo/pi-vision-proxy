@@ -27,11 +27,19 @@ const VISION_MAX_TOKENS = 1024;
 const MAX_CONCURRENT = 4;
 const NOTIFY_DEDUP_MS = 10_000;
 
-const VISION_PROMPT = `你是图像识别助手, 代替只支持文本的主模型识别用户发送的图片。请仔细观察这张图片, 并尽可能详细地描述其中的内容:
-- 所有可见的文字请原样列出(包括代码、报错信息、UI 文案、图表数据、链接等)
-- 描述图片中的界面、布局、元素及其位置关系
-- 如果用户消息中包含针对图片的问题, 请优先回答该问题
-直接输出描述内容, 不要任何前缀或解释。`;
+const DEFAULT_VISION_PROMPT = `你是多模态辅助模型, 代替只支持文本的主模型处理用户发送的图片。
+用户消息: {userText}
+请优先按用户消息的意图处理图片, 直接输出处理结果(不要任何前缀或解释):
+- 如果用户要求参考/模仿图片(如"参考这张图的样式/风格/布局/配色做..."), 请提取主模型复现所需的一切细节: 配色(尽量给具体色值)、字体、布局结构、间距、组件/元素清单、风格特征、图片/图标等, 描述到主模型不看图也能复现的程度
+- 如果用户有具体问题(如"这是什么""翻译图中文字""读取报错信息""图中数据"), 直接回答问题
+- 如果用户没有具体要求, 则详细描述图片内容: 所有可见文字原样列出、界面布局、元素及其位置
+如果图片与用户消息不相关(如用户只是在聊天中附带图片), 简要说明图片内容即可, 不要编造细节。`;
+
+// 渲染自定义模板: {userText} 替换为用户消息(可能为空)
+function renderPrompt(template: string, userText: string): string {
+  const text = userText.trim() || "(用户没有额外说明, 请按最后一条规则处理)";
+  return template.replaceAll("{userText}", text);
+}
 
 // 匹配消息文本中出现的本地图片路径(pi 粘贴图片时插入的是临时文件路径文本)
 const IMAGE_PATH_RE =
@@ -60,18 +68,25 @@ function readImageFile(filePath: string): ImageContent | undefined {
 
 interface VisionConfig {
   visionModel: string;
+  /** 自定义识图 prompt 模板, {userText} 为用户消息占位符; 省略用默认 */
+  prompt?: string;
 }
 
 function readConfig(): VisionConfig {
   try {
     const parsed = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as Partial<VisionConfig>;
+    const config: VisionConfig = { visionModel: DEFAULT_VISION_MODEL };
     if (typeof parsed.visionModel === "string" && parsed.visionModel.trim()) {
-      return { visionModel: parsed.visionModel.trim() };
+      config.visionModel = parsed.visionModel.trim();
     }
+    if (typeof parsed.prompt === "string" && parsed.prompt.trim()) {
+      config.prompt = parsed.prompt.trim();
+    }
+    return config;
   } catch {
     // 配置文件不存在或损坏: 使用默认值
+    return { visionModel: DEFAULT_VISION_MODEL };
   }
-  return { visionModel: DEFAULT_VISION_MODEL };
 }
 
 function writeConfig(config: VisionConfig): void {
@@ -129,9 +144,9 @@ async function runVision(
   const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout;
 
   try {
-    const prompt = userText.trim()
-      ? `${VISION_PROMPT}\n\n用户消息: ${userText.trim()}`
-      : VISION_PROMPT;
+    const { prompt: customPrompt } = readConfig();
+    const template = customPrompt?.trim() || DEFAULT_VISION_PROMPT;
+    const prompt = renderPrompt(template, userText);
     const messages: Message[] = [
       {
         role: "user",

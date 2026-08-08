@@ -26,7 +26,16 @@ pi install git:github.com/<user>/pi-vision-proxy
 - **`/vision-model <provider/model>`**:直接设置,例如 `/vision-model 123nhh/claude-haiku-4-5-20251001`。
 - **`/vision-model reset`**:恢复默认 `opencode/mimo-v2.5-free`。
 
-配置保存在 `~/.pi/agent/vision-proxy.json`,也可以直接编辑该文件。
+配置保存在 `~/.pi/agent/vision-proxy.json`,也可以直接编辑该文件:
+
+```json
+{
+  "visionModel": "opencode/mimo-v2.5-free",
+  "prompt": "自定义识图 prompt 模板, {userText} 会被替换为用户消息"
+}
+```
+
+默认 prompt 是**动态**的:识图模型先看用户消息再处理图片——用户要求参考/模仿图片时提取样式细节(配色、布局、组件等),有具体问题时直接回答,没有要求时才做通用描述。
 
 ## 工作原理
 
