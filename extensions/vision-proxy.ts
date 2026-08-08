@@ -289,6 +289,36 @@ async function runVisionMulti(
 }
 
 /**
+ * 仅查缓存(不触发识别): 返回已识别过的描述数组; 未识别过返回 undefined。
+ * 多图: 优先合并缓存, 回退逐图缓存(合并失败时逐张识别的结果)。
+ */
+function cachedDescs(
+  visionModel: string,
+  images: ImageContent[],
+  userText: string,
+): Array<string | undefined> | undefined {
+  if (images.length === 1) {
+    const k = cacheKey(visionModel, images[0], userText);
+    if (!descCache.has(k)) return undefined;
+    return [descCache.get(k)];
+  }
+  const mk = multiCacheKey(visionModel, images, userText);
+  const merged = descCache.get(mk);
+  if (merged !== undefined) {
+    const out: Array<string | undefined> = [merged];
+    for (let i = 1; i < images.length; i++) out.push("(已包含在上方合并识别结果中)");
+    return out;
+  }
+  const out: Array<string | undefined> = [];
+  for (const img of images) {
+    const k = cacheKey(visionModel, img, userText);
+    if (!descCache.has(k)) return undefined;
+    out.push(descCache.get(k));
+  }
+  return out;
+}
+
+/**
  * 多图识别: 多图时合并为一次调用(整体分析 + 对比), 结果挂在第一张图位置;
  * 合并失败回退为逐张并行识别(限流 MAX_CONCURRENT)。返回与输入顺序一致的结果数组。
  */
@@ -397,7 +427,7 @@ export default function (pi: ExtensionAPI) {
     if (model.input?.includes("image")) return;
 
     const { visionModel } = readConfig();
-    // 收集历史中所有含图片块的消息(切换模型后旧的多模态消息也会被替换为描述)
+    // 收集历史中所有含图片块的消息
     const targets: Array<{
       msg: (typeof event.messages)[number];
       images: ImageContent[];
@@ -420,30 +450,52 @@ export default function (pi: ExtensionAPI) {
     }
     if (targets.length === 0) return;
 
-    // 所有含图消息并行识别(切换模型后历史多图也不阻塞太久)
-    ctx.ui.setWorkingMessage(`识别图片中... (${visionModel})`);
-    let results: Array<Array<string | undefined>>;
-    try {
-      results = await Promise.all(
-        targets.map((t) => describeImages(ctx, visionModel, t.images, t.userText)),
-      );
-    } finally {
-      ctx.ui.setWorkingMessage();
+    // 仅等待“识别进行中”的图片(当前回合 input 预热的请求); 历史旧图不触发识别, 只放占位提示
+    let needsWait = false;
+    for (const t of targets) {
+      if (cachedDescs(visionModel, t.images, t.userText) !== undefined) continue;
+      if (inFlight.has(multiCacheKey(visionModel, t.images, t.userText))) {
+        needsWait = true;
+        continue;
+      }
+      for (const img of t.images) {
+        if (inFlight.has(cacheKey(visionModel, img, t.userText))) {
+          needsWait = true;
+          break;
+        }
+      }
+    }
+    if (needsWait) {
+      ctx.ui.setWorkingMessage(`识别图片中... (${visionModel})`);
+      try {
+        // 等待所有进行中的识别完成(并发有限)
+        await Promise.allSettled([...inFlight.values()].map((p) => p.catch(() => undefined)));
+      } finally {
+        ctx.ui.setWorkingMessage();
+      }
     }
 
     const messages = event.messages.map((m) => {
       const ti = targets.findIndex((t) => t.msg === m);
       if (ti < 0) return m;
-      const descs = results[ti];
+      const t = targets[ti];
+      const descs = cachedDescs(visionModel, t.images, t.userText);
+      // 未识别过的图片: 占位提示并引导主模型用工具按需查看(不自动识别历史图片)
+      const paths = [...t.userText.matchAll(IMAGE_PATH_RE)]
+        .map((mm) => mm[2])
+        .filter((p) => existsSync(p));
+      const placeholder = paths.length > 0
+        ? `[图片未自动识别, 需要查看时可调用 vision_describe("${paths[0]}")]`
+        : "[图片未自动识别(历史图片), 需要查看时调用 vision_describe 并传入图片路径]";
       const newContent = [];
       let imgIdx = 0;
       for (const block of m.content) {
         if (block.type === "image") {
-          const desc = descs[imgIdx++];
+          const desc = descs?.[imgIdx++];
           newContent.push(
             desc
               ? { type: "text", text: `[图片识别结果 - ${visionModel}]\n${desc}` }
-              : { type: "text", text: "[图片识别失败, 已跳过; 如需要可调用 vision_describe 重新识别]" },
+              : { type: "text", text: placeholder },
           );
         } else {
           newContent.push(block);
