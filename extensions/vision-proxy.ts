@@ -326,6 +326,28 @@ export default function (pi: ExtensionAPI) {
     return { messages };
   });
 
+  const VISION_TOOL_NAME = "vision_describe";
+
+  // 动态注册: 当前模型多模态时从 active 工具中移除 vision_describe(系统 prompt 与模型 tools API 同步消失),
+  // text-only 时加回。跟随模型切换实时生效。
+  function syncVisionTool(model: { input?: string[] } | undefined): void {
+    if (!model) return;
+    const supportsImage = model.input?.includes("image") ?? false;
+    const active = pi.getActiveTools();
+    const has = active.includes(VISION_TOOL_NAME);
+    if (supportsImage && has) {
+      pi.setActiveTools(active.filter((t) => t !== VISION_TOOL_NAME));
+    } else if (!supportsImage && !has) {
+      pi.setActiveTools([...active, VISION_TOOL_NAME]);
+    }
+  }
+  pi.on("model_select", (event) => {
+    syncVisionTool(event.model);
+  });
+  pi.on("session_start", (_event, ctx) => {
+    syncVisionTool(ctx.model);
+  });
+
   // 多模态主模型下禁用 vision_describe: 拦截调用(pi 扩展 API 无工具注销机制, 用运行时拦截达到等效效果)
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "vision_describe") return;
