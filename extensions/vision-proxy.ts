@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { uuidv7, type ImageContent } from "@earendil-works/pi-ai";
 import { complete, type Message } from "@earendil-works/pi-ai/compat";
@@ -24,8 +24,11 @@ const CONFIG_FILE = join(getAgentDir(), "vision-proxy.json");
 const DEFAULT_VISION_MODEL = "opencode/mimo-v2.5-free";
 const CACHE_LIMIT = 50;
 const VISION_TIMEOUT_MS = 45_000;
-const VISION_MAX_TOKENS = 1024;
+// mimo 等模型有 reasoning 行为, token 上限过小时 content 可能为空; 4096 保证描述质量
+const VISION_MAX_TOKENS = 4096;
 const MAX_CONCURRENT = 4;
+// 超过该大小的图片跳过识别(同步 base64 会卡 UI), 并提示用户
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const NOTIFY_DEDUP_MS = 10_000;
 
 const DEFAULT_VISION_PROMPT = `你是多模态辅助模型, 代替只支持文本的主模型处理用户发送的图片。
@@ -34,6 +37,7 @@ const DEFAULT_VISION_PROMPT = `你是多模态辅助模型, 代替只支持文�
 - 如果用户要求参考/模仿图片(如"参考这张图的样式/风格/布局/配色做..."), 请提取主模型复现所需的一切细节: 配色(尽量给具体色值)、字体、布局结构、间距、组件/元素清单、风格特征、图片/图标等, 描述到主模型不看图也能复现的程度
 - 如果用户有具体问题(如"这是什么""翻译图中文字""读取报错信息""图中数据"), 直接回答问题
 - 如果用户没有具体要求, 则详细描述图片内容: 所有可见文字原样列出、界面布局、元素及其位置
+- 如果一次提供了多张图片: 先整体分析(对比差异、共同点、相互关系), 再按图片顺序逐张说明关键内容
 如果图片与用户消息不相关(如用户只是在聊天中附带图片), 简要说明图片内容即可, 不要编造细节。`;
 
 // 渲染自定义模板: {userText} 替换为用户消息(可能为空)
@@ -55,11 +59,12 @@ const MIME_BY_EXT: Record<string, string> = {
   ".bmp": "image/bmp",
 };
 
-/** 读取本地图片文件为 ImageContent; 失败返回 undefined。 */
+/** 读取本地图片文件为 ImageContent; 不存在/格式不支持/超过大小上限返回 undefined。 */
 function readImageFile(filePath: string): ImageContent | undefined {
   try {
     const mimeType = MIME_BY_EXT[extname(filePath).toLowerCase()];
     if (!mimeType) return undefined;
+    if (statSync(filePath).size > MAX_IMAGE_BYTES) return undefined; // 大图跳过, 防同步 base64 卡 UI
     const data = readFileSync(filePath).toString("base64");
     return { type: "image", data, mimeType };
   } catch {
@@ -210,13 +215,116 @@ function describeImage(
   return p;
 }
 
-/** 多图并行识别(限流 MAX_CONCURRENT), 返回与输入顺序一致的结果数组。 */
+/** 多图合并缓存 key: 所有图哈希(按序) + prompt。 */
+function multiCacheKey(
+  visionModel: string,
+  images: ImageContent[],
+  prompt = "",
+): string {
+  const imgHash = images
+    .map((i) => createHash("sha1").update(i.data).digest("hex").slice(0, 12))
+    .join("+");
+  const promptHash = createHash("sha1").update(prompt).digest("hex").slice(0, 12);
+  return `multi:${visionModel}:${imgHash}:${promptHash}`;
+}
+
+/** 一次调用识别多张图(支持对比/关系类问题); 任何失败返回 undefined。 */
+async function runVisionMulti(
+  ctx: ExtensionContext,
+  visionModel: string,
+  images: ImageContent[],
+  userText: string,
+  key: string,
+): Promise<string | undefined> {
+  const model = resolveModel(ctx, visionModel);
+  if (!model || !model.input?.includes("image")) return undefined;
+
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) return undefined;
+
+  const timeout = AbortSignal.timeout(VISION_TIMEOUT_MS);
+  const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout;
+
+  try {
+    const { prompt: customPrompt } = readConfig();
+    const template = customPrompt?.trim() || DEFAULT_VISION_PROMPT;
+    const prompt = renderPrompt(template, userText);
+    const content: Array<{ type: "text"; text: string } | ImageContent> = [
+      { type: "text", text: prompt },
+    ];
+    for (const img of images) {
+      content.push({ type: "image", data: img.data, mimeType: img.mimeType });
+    }
+    const messages: Message[] = [
+      { role: "user", content, timestamp: Date.now() },
+    ];
+    const response = await complete(model, { messages }, {
+      apiKey: auth.apiKey,
+      headers: auth.headers,
+      env: auth.env,
+      signal,
+      maxTokens: VISION_MAX_TOKENS,
+      cacheRetention: "none",
+      sessionId: uuidv7(),
+    });
+    const text = response.content
+      .filter((c): c is { type: "text"; text: string } => c.type === "text")
+      .map((c) => c.text)
+      .join("\n")
+      .trim();
+    if (!text) return undefined;
+    if (descCache.size >= CACHE_LIMIT) {
+      const oldest = descCache.keys().next().value;
+      if (oldest !== undefined) descCache.delete(oldest);
+    }
+    descCache.set(key, text);
+    return text;
+  } catch (error) {
+    const reason = error instanceof Error && error.name === "TimeoutError"
+      ? "超时"
+      : error instanceof Error ? error.message : String(error);
+    notifyOnce(ctx, key, `图片识别失败(${visionModel}): ${reason}`);
+    return undefined;
+  }
+}
+
+/**
+ * 多图识别: 多图时合并为一次调用(整体分析 + 对比), 结果挂在第一张图位置;
+ * 合并失败回退为逐张并行识别(限流 MAX_CONCURRENT)。返回与输入顺序一致的结果数组。
+ */
 async function describeImages(
   ctx: ExtensionContext,
   visionModel: string,
   images: ImageContent[],
   userText: string,
 ): Promise<Array<string | undefined>> {
+  if (images.length === 1) {
+    return [await describeImage(ctx, visionModel, images[0], userText)];
+  }
+  // 多图: 一次合并调用(支持对比/关系问题)
+  const key = multiCacheKey(visionModel, images, userText);
+  let text = descCache.get(key);
+  if (text === undefined) {
+    const pending = inFlight.get(key);
+    if (pending) {
+      text = await pending;
+    } else {
+      const p = runVisionMulti(ctx, visionModel, images, userText, key);
+      inFlight.set(key, p);
+      try {
+        text = await p;
+      } finally {
+        if (inFlight.get(key) === p) inFlight.delete(key);
+      }
+    }
+  }
+  if (text !== undefined) {
+    const out = new Array<string | undefined>(images.length);
+    out[0] = text;
+    for (let i = 1; i < images.length; i++) out[i] = "(已包含在上方合并识别结果中)";
+    return out;
+  }
+  // 合并失败: 回退逐张并行识别
   const out = new Array<string | undefined>(images.length);
   for (let i = 0; i < images.length; i += MAX_CONCURRENT) {
     const slice = images.slice(i, i + MAX_CONCURRENT);
@@ -233,12 +341,21 @@ async function describeImages(
 /**
  * 扫描文本中的本地图片路径(pi 粘贴图片的默认形式), 将存在的图片转为图片块。
  * 不修改原文本: 路径保留在消息中, 方便用户回查传过什么图片。
+ * 超过大小上限的图片跳过并提示。
  */
-function collectImagePaths(text: string): ImageContent[] {
+function collectImagePaths(ctx: ExtensionContext, text: string): ImageContent[] {
   const images: ImageContent[] = [];
   for (const m of text.matchAll(IMAGE_PATH_RE)) {
     const path = m[2];
     if (!existsSync(path)) continue; // 文件不存在/不可读: 忽略
+    try {
+      if (statSync(path).size > MAX_IMAGE_BYTES) {
+        notifyOnce(ctx, `big:${path}`, `图片超过 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB 已跳过识别: ${path}`);
+        continue;
+      }
+    } catch {
+      continue;
+    }
     const image = readImageFile(path);
     if (image) images.push(image);
   }
@@ -256,7 +373,7 @@ export default function (pi: ExtensionAPI) {
     const userText = event.text ?? "";
 
     // 1) 文本中的本地图片路径(pi 粘贴图片的默认形式)
-    const pathImages = collectImagePaths(userText);
+    const pathImages = collectImagePaths(ctx, userText);
     // 2) 合并真正的图片块
     const images = [...pathImages, ...(event.images ?? [])];
     if (images.length === 0) return;
@@ -313,7 +430,7 @@ export default function (pi: ExtensionAPI) {
           newContent.push(
             desc
               ? { type: "text", text: `[图片识别结果 - ${visionModel}]\n${desc}` }
-              : { type: "text", text: "[图片识别失败, 已跳过]" },
+              : { type: "text", text: "[图片识别失败, 已跳过; 如需要可调用 vision_describe 重新识别]" },
           );
         } else {
           newContent.push(block);
@@ -365,32 +482,46 @@ export default function (pi: ExtensionAPI) {
     name: "vision_describe",
     label: "识图",
     description:
-      "识别/处理一张本地图片(调用独立的多模态识图模型, 不消耗主模型多模态能力)。当主模型只支持文本、需要查看图片内容时调用, 例如用户消息中提到的图片文件、工具生成或发现的截图等, 也可对已看过的图片提出更具体的问题深入查看。参数 path 为本地图片文件路径(支持 png/jpg/jpeg/gif/webp/bmp); 如有具体需求(提取配色、翻译图中文字、读取数据、描述布局、判断内容等)请通过 prompt 参数传入, 识图模型会按你的要求处理, 效果等同原生多模态模型看图。",
-    promptSnippet: "vision_describe(path, prompt?) - 用多模态识图模型处理本地图片, 可按需传入处理要求",
+      "识别/处理本地图片(调用独立的多模态识图模型, 不消耗主模型多模态能力)。当主模型只支持文本、需要查看图片内容时调用, 例如用户消息中提到的图片文件、工具生成或发现的截图等, 也可对已看过的图片提出更具体的问题深入查看。参数 path 为本地图片文件路径(支持 png/jpg/jpeg/gif/webp/bmp, 超过 15MB 跳过); 需要对比/分析多张图时, 用 paths 传入其余图片路径, 一次调用整体处理; 如有具体需求(提取配色、翻译图中文字、读取数据、描述布局、判断内容等)请通过 prompt 参数传入, 识图模型会按你的要求处理, 效果等同原生多模态模型看图。",
+    promptSnippet: "vision_describe(path, prompt?, paths?) - 用多模态识图模型处理本地图片, 可按需传入处理要求与多图对比",
     parameters: Type.Object({
       path: Type.String({ description: "本地图片文件路径" }),
       prompt: Type.Optional(
-        Type.String({ description: "对图片的处理要求(可选): 如提取配色、翻译图中文字、读取表格数据、描述布局风格等; 省略时默认详细描述图片内容" }),
+        Type.String({ description: "对图片的处理要求(可选): 如提取配色、翻译图中文字、读取表格数据、描述布局风格、对比多张图等; 省略时默认详细描述图片内容" }),
+      ),
+      paths: Type.Optional(
+        Type.Array(Type.String({ description: "附加图片路径(可选): 与 path 一起一次调用综合处理, 适合对比/关系类问题" })),
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const image = readImageFile(params.path);
-      if (!image) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `无法读取图片 ${params.path}: 文件不存在、不可读或格式不支持(仅支持 png/jpg/jpeg/gif/webp/bmp)`,
-            },
-          ],
-          details: {},
-        };
-      }
       const { visionModel } = readConfig();
+      ctx.ui.setWorkingMessage(`识别图片中... (${visionModel})`);
       try {
-        const [desc] = await describeImages(ctx, visionModel, [image], params.prompt ?? "");
+        const allPaths = [params.path, ...(params.paths ?? [])];
+        const images: ImageContent[] = [];
+        const failed: string[] = [];
+        for (const p of allPaths) {
+          const img = readImageFile(p);
+          if (img) images.push(img);
+          else failed.push(p);
+        }
+        if (images.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `无法读取图片(文件不存在、不可读、超过 15MB 或格式不支持): ${failed.join(", ")}`,
+              },
+            ],
+            details: {},
+          };
+        }
+        const descs = await describeImages(ctx, visionModel, images, params.prompt ?? "");
+        const parts = descs.filter((d): d is string => !!d);
+        const main = parts.length > 0 ? parts.join("\n") : "[图片识别失败, 已跳过; 可稍后重试]";
+        const note = failed.length > 0 ? `\n(以下图片读取失败已跳过: ${failed.join(", ")})` : "";
         return {
-          content: [{ type: "text" as const, text: desc ?? "[图片识别失败, 已跳过]" }],
+          content: [{ type: "text" as const, text: main + note }],
           details: {},
         };
       } catch (err) {
@@ -403,6 +534,8 @@ export default function (pi: ExtensionAPI) {
           ],
           details: {},
         };
+      } finally {
+        ctx.ui.setWorkingMessage();
       }
     },
   });
