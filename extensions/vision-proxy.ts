@@ -324,15 +324,18 @@ export default function (pi: ExtensionAPI) {
     return { messages };
   });
 
-  // 主模型可主动调用的识图工具: 需要查看任意本地图片时自行调用
+  // 主模型可主动调用的识图工具: 需要查看任意本地图片时自行调用, 可携带处理要求
   pi.registerTool({
     name: "vision_describe",
     label: "识图",
     description:
-      "识别/描述一张本地图片(调用独立的多模态识图模型, 不消耗主模型多模态能力)。当主模型只支持文本、需要查看图片内容时调用, 例如用户消息中提到的图片文件、工具生成或发现的截图等。参数 path 为本地图片文件路径(支持 png/jpg/jpeg/gif/webp/bmp)。",
-    promptSnippet: "vision_describe(path) - 用多模态识图模型描述本地图片内容",
+      "识别/处理一张本地图片(调用独立的多模态识图模型, 不消耗主模型多模态能力)。当主模型只支持文本、需要查看图片内容时调用, 例如用户消息中提到的图片文件、工具生成或发现的截图等。参数 path 为本地图片文件路径(支持 png/jpg/jpeg/gif/webp/bmp); 如有具体需求(提取配色、翻译图中文字、读取数据、描述布局、判断内容等)请通过 prompt 参数传入, 识图模型会按你的要求处理, 效果等同原生多模态模型看图。",
+    promptSnippet: "vision_describe(path, prompt?) - 用多模态识图模型处理本地图片, 可按需传入处理要求",
     parameters: Type.Object({
       path: Type.String({ description: "本地图片文件路径" }),
+      prompt: Type.Optional(
+        Type.String({ description: "对图片的处理要求(可选): 如提取配色、翻译图中文字、读取表格数据、描述布局风格等; 省略时默认详细描述图片内容" }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const image = readImageFile(params.path);
@@ -349,7 +352,7 @@ export default function (pi: ExtensionAPI) {
       }
       const { visionModel } = readConfig();
       try {
-        const [desc] = await describeImages(ctx, visionModel, [image], "");
+        const [desc] = await describeImages(ctx, visionModel, [image], params.prompt ?? "");
         return {
           content: [{ type: "text" as const, text: desc ?? "[图片识别失败, 已跳过]" }],
           details: {},
